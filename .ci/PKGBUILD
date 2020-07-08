@@ -1,40 +1,31 @@
-# Maintainer: Sam Linnfer <littlelightlittlefire@gmail.com>
-pkgname=souffle-git
-pkgver=r2173.ecb9d25a
+# Contributor: Eric Schulte <eschulte@grammatech.com>
+# Maintainer: Eric Schulte <eschulte@grammatech.com>
+_srcname=ddisasm
+pkgname=ddisasm-git
+pkgver=v0.1.1.r628.gcd19fb5
 pkgrel=1
-pkgdesc="Soufflé is a translator of declarative Datalog programs into the C++ language"
-arch=('any')
-url="https://github.com/souffle-lang/souffle"
-license=('UPL')
-groups=()
-depends=('sqlite' 'python' 'zlib')
-makedepends=('git' 'autoconf' 'automake' 'bison' 'doxygen' 'flex' 'sqlite' 'libtool' 'jdk8-openjdk' 'pkg-config' 'python' 'zlib' 'mcpp')
-provides=('souffle-git')
-conflicts=('souffle-git')
-backup=()
-options=()
-install=
-noextract=()
-source=('git+https://github.com/souffle-lang/souffle.git#tag=1.4.0')
-md5sums=('SKIP')
-
-_gitname=souffle
+pkgdesc="A fast and accurate disassembler"
+arch=('x86_64')
+url="https://github.com/grammatech/ddisasm"
+license=('aGPLv3')
+depends=('capstone' 'libehp' 'boost')
+makedepends=('git' 'cmake' 'souffle' 'mcpp' 'lief' 'gtirb' 'gtirb-pprinter')
+provides=('ddisasm')
+source=('git://github.com/grammatech/ddisasm.git')
+sha512sums=('SKIP')
 
 pkgver() {
-    cd "$srcdir/${pkgname%-git}"
-    printf "r%s.%s" "$(git rev-list --count HEAD)" "$(git rev-parse --short HEAD)"
+  cd "$_srcname"
+  git describe --long --tags | sed 's/\([^-]*-g\)/r\1/;s/-/./g'
 }
 
 build() {
-    cd "$srcdir/${pkgname%-git}"
-    sh ./bootstrap
-    ./configure --prefix=/usr --enable-64bit-domain
-
-    make -j
+    cd "$_srcname/"
+    cmake . -Bbuild -DCMAKE_INSTALL_PREFIX=/usr -DLIEF_ROOT=/usr -DCMAKE_BUILD_TYPE=$BUILD_TYPE
+    make -C build
 }
 
 package() {
-    cd "$srcdir/${pkgname%-git}"
-    make DESTDIR="$pkgdir/" install
-    cp $srcdir/${pkgname%-git}/include/souffle/RamTypes.h $pkgdir/usr/include/souffle/
+  cd "$_srcname/build"
+  make DESTDIR="$pkgdir" install
 }

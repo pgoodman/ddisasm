@@ -1,0 +1,168 @@
+//===- cfg.dl ----------------------------------------*- datalog -*-===//
+//
+//  Copyright (C) 2019 GrammaTech, Inc.
+//
+//  This code is licensed under the GNU Affero General Public License
+//  as published by the Free Software Foundation, either version 3 of
+//  the License, or (at your option) any later version. See the
+//  LICENSE.txt file in the project root for license terms or visit
+//  https://www.gnu.org/licenses/agpl.txt.
+//
+//  This program is distributed in the hope that it will be useful,
+//  but WITHOUT ANY WARRANTY; without even the implied warranty of
+//  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+//  GNU Affero General Public License for more details.
+//
+//  This project is sponsored by the Office of Naval Research, One Liberty
+//  Center, 875 N. Randolph Street, Arlington, VA 22203 under contract #
+//  N68335-17-C-0700.  The content of the information does not necessarily
+//  reflect the position or policy of the Government and no official
+//  endorsement should be inferred.
+//
+//===----------------------------------------------------------------------===//
+/**
+This module generates the control flow graph of the disassembled code
+*/
+
+.decl cfg_edge(src:address,dest:address,conditional:symbol,indirect:symbol,type:symbol)
+.output cfg_edge
+
+// edges whose destination we do not know
+.decl cfg_edge_to_top(src:address,conditional:symbol,type:symbol)
+.output cfg_edge_to_top
+
+.decl cfg_edge_to_symbol(src:address,symbol:symbol)
+.output cfg_edge_to_symbol
+
+/////////////////////////////////////////////////////////////////////////////////
+// jump table identification
+.decl jump_table(Src:address,Data:address)
+
+//use the data access pattern
+jump_table(EA,Initial_memory):-
+    code(EA),
+    indirect_jump(EA),
+    arch.pointer_size(Pt_size),
+    data_access_pattern(Initial_memory,Pt_size,Pt_size,EA),
+    symbolic_data(Initial_memory,Pt_size,Dest_block),
+    refined_block(Dest_block).
+
+//use just the constant in the jump
+jump_table(EA,Initial_memory):-
+    code(EA),
+    indirect_jump(EA),
+    arch.pointer_size(Pt_size),
+    symbolic_operand(EA,1,Initial_memory,"data"),
+    symbolic_data(Initial_memory,Pt_size,Dest_block),
+    refined_block(Dest_block).
+
+jump_table(EA,Memory+Pt_size):-
+    jump_table(EA,Memory),
+    arch.pointer_size(Pt_size),
+    symbolic_data(Memory+Pt_size,Pt_size,Dest_block),
+    refined_block(Dest_block),
+    !data_access_pattern(Memory+Pt_size,_,_,_).
+
+// we have another access to the same table (the access can be before or after)
+jump_table(EA,Memory+Pt_size):-
+    jump_table(EA,Memory),
+    arch.pointer_size(Pt_size),
+    symbolic_data(Memory,Pt_size,Content_prev),
+    symbolic_data(Memory+Pt_size,Pt_size,Content_next),
+    refined_block(Content_next),
+    data_access_pattern(Memory+Pt_size,Pt_size,Pt_size,EA),
+    (
+        EA < Content_prev,
+        EA < Content_next
+        ;
+        EA > Content_prev,
+        EA > Content_next
+    ).
+
+// Resolve easy jumps that access a straightforward jump table
+.decl resolved_jump(Src:address,Dest:address)
+.output resolved_jump
+
+resolved_jump(EA,Dest):-
+    jump_table(EA,Memory),
+    symbolic_data(Memory,_,Dest),
+    refined_block(Dest).
+
+
+//////////////////////////////////////////////////////////////////////////////
+// edge creation
+
+cfg_edge(Src,Dest,Conditional,Indirect,"branch"):-
+    refined_block_last_instruction(Src,EA),
+    (
+        direct_jump(EA,Dest), Indirect = "false";
+        pc_relative_jump(EA,Dest), Indirect = "false";
+        resolved_jump(EA,Dest), Indirect = "true"
+    ),
+    refined_block(Dest),
+    (
+        unconditional_jump(EA), Conditional = "false";
+        !unconditional_jump(EA),Conditional = "true"
+    ).
+
+cfg_edge(Src,Dest,"false","false","call"):-
+    refined_block_last_instruction(Src,EA),
+    (
+        direct_call(EA,Dest);
+        pc_relative_call(EA,Dest)
+    ),
+    refined_block(Dest).
+
+cfg_edge(Src,Dest,"false","false","fallthrough"):-
+    refined_block_last_instruction(Src,EA),
+    may_fallthrough(EA,Dest),
+    !no_return_call(EA),
+    code_in_refined_block(Dest,Dest),
+    next_refined_block_in_section(Src,Dest).
+
+cfg_edge(ReturnBlock,NextBlock,"false","false","return"):-
+    cfg_edge(Caller,Block,_,_,"call"),
+    cfg_edge(Caller,NextBlock,_,_,"fallthrough"),
+    function_inference.in_function(Block,FunctionEntry),
+    function_inference.in_function(ReturnBlock,FunctionEntry),
+    refined_block_last_instruction(ReturnBlock,Insn),
+    return(Insn).
+
+cfg_edge_to_top(Src,Conditional,"branch"):-
+    refined_block_last_instruction(Src,EA),
+    (
+        reg_jump(EA,_);
+        indirect_jump(EA)
+    ),
+    (
+        unconditional_jump(EA), Conditional = "false";
+        !unconditional_jump(EA), Conditional = "true"
+    ).
+
+cfg_edge_to_top(Src,"false","call"):-
+    refined_block_last_instruction(Src,EA),
+    (
+        reg_call(EA,_);
+        indirect_call(EA)
+    ).
+
+// a return to top if no other return exists
+cfg_edge_to_top(Src,"false","return"):-
+    refined_block_last_instruction(Src,Insn),
+    return(Insn),
+    !cfg_edge(Src,_,_,_,"return").
+
+cfg_edge_to_symbol(Src,Symbol):-
+    refined_block_last_instruction(Src,EA),
+    plt_entry(EA,Symbol),
+    !defined_symbol(_,_,_,_,_,Symbol).
+
+// pc relative jump with undefined destination
+cfg_edge_to_top(Src,Conditional,"branch"):-
+    refined_block_last_instruction(Src,EA),
+    pc_relative_jump(EA,Dest),
+    !refined_block(Dest),
+    (
+        unconditional_jump(EA), Conditional = "false";
+        !unconditional_jump(EA),Conditional = "true"
+    ).

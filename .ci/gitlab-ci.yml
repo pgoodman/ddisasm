@@ -1,81 +1,304 @@
 variables:
   DOCKER_REGISTRY: "docker.grammatech.com"
   LOCAL_IMAGE_NAME: '$CI_BUILD_REF_NAME-$CI_PIPELINE_ID'
+  GTIRB_BRANCH: "master"
+
+before_script:
+  - case "$(uname -s)" in
+        CYGWIN*) systeminfo;;
+        *) docker info;;
+    esac
 
 stages:
+  - check-format
   - build
   - test-and-tag
+  - deploy
   - cleanup
+
+# The two build templates below ultimately call the build script for the
+# appropriate platform & task (the .ci/build-*.sh scripts).
+# For windows builds, this is done directly. For linux builds, the build script
+# is called in the Dockerfile.
 
 .build-template: &build
   script:
-    - git clone https://git.grammatech.com/rewriting/gtirb.git
-    - git clone https://git.grammatech.com/rewriting/gtirb-pprinter.git
-    - docker build -f .ci/Dockerfile.$OS -t ${LOCAL_IMAGE_NAME}-${OS} .
+    - case $OS in
+       ubuntu16) JOB_NAME='debian-installer-ubuntu16' ;;
+       ubuntu18) JOB_NAME='debian-installer-ubuntu18' ;;
+       arch) JOB_NAME='package-arch' ;;
+       esac
+    # Acquire gtirb artifacts
+    - curl -L https://git.grammatech.com/rewriting/gtirb/-/jobs/artifacts/${GTIRB_BRANCH}/download?job=${JOB_NAME} --output "gtirb-${OS}-artifacts.zip"
+    - unzip -l gtirb-${OS}-artifacts.zip
+    # Acquire gtirb pprinter artifacts
+    - GTIRB_PPRINTER_BRANCH=$((grep -Eo "check_gtirb_pprinter_branch\([^)]+" CMakeLists.txt | sed 's/check_gtirb_pprinter_branch(//') || echo "master")
+    - "echo \"GTIRB_PPRINTER_BRANCH is: $GTIRB_PPRINTER_BRANCH\""
+    - curl -L https://git.grammatech.com/rewriting/gtirb-pprinter/-/jobs/artifacts/${GTIRB_PPRINTER_BRANCH}/download?job=${JOB_NAME} --output "gtirb-pprinter-${OS}-artifacts.zip"
+    - unzip -l gtirb-pprinter-${OS}-artifacts.zip
+    # Extra packages
+    - cp /u4/TARBALLS/debloat/pkgs/libcapstone-dev_4.0.1-gt2_amd64.deb ./
+    - git clone https://git.zephyr-software.com/opensrc/libehp.git && pushd libehp && git reset --hard ddb106c4c1e521bf4b282d17e2a8abf0aa0fe721 && popd
+    - docker build -f .ci/Dockerfile.${OS}-${COMPILER} -t ${LOCAL_IMAGE_NAME}-${OS}-${COMPILER}-${BUILD_TYPE,,} --build-arg CPACK_GENERATOR=${CPACK_GENERATOR} --build-arg CMAKE_BUILD_TYPE=$BUILD_TYPE .
 
-build-ubuntu16:
-  stage: build
-  variables:
-    OS: 'ubuntu16'
-  <<: *build
-
-build-ubuntu18:
-  stage: build
-  variables:
-    OS: 'ubuntu18'
-  <<: *build
-
-build-arch:
-  stage: build
-  variables:
-    OS: 'arch'
-  <<: *build
-
-run-ubuntu16:
-  stage: test-and-tag
-  variables:
-    OS: 'ubuntu16'
+.build-windows-template: &build-windows
+  artifacts:
+    name: "$CI_COMMIT_REF_NAME-$CI_JOB_NAME"
+    paths:
+      - ./DDISASM-*-win64
   script:
-    - docker run ${LOCAL_IMAGE_NAME}-${OS} /bin/bash -c \
-      "cd tests/ && ./test_small.sh && ./test_small.sh -strip && ./test_assembler_examples.sh -strip"
-    - if [ "$CI_BUILD_REF_NAME" == "master" ] && [ "$OS" == "ubuntu16" ];
+    - git clone https://git.zephyr-software.com/opensrc/libehp.git
+    - .ci/build-windows.sh ${BUILD_TYPE}
+
+.test-and-tag-template: &test-and-tag
+  script:
+    - if [ "$CI_COMMIT_REF_SLUG" = "master" ];
       then
-        docker tag ${LOCAL_IMAGE_NAME}-${OS} $DOCKER_REGISTRY/$CI_PROJECT_PATH/${OS}:latest;
-        docker login -u gitlab-ci-token -p $CI_BUILD_TOKEN $DOCKER_REGISTRY;
-        docker push $DOCKER_REGISTRY/$CI_PROJECT_PATH/${OS}:latest;
+          PUSH_TAG=latest;
+      else
+          PUSH_TAG=$CI_COMMIT_REF_SLUG;
       fi
+    - curl -L https://git.grammatech.com/rewriting/gtirb/-/jobs/artifacts/${GTIRB_BRANCH}/download?job=python-wheel --output "gtirb-wheel.zip"
+    - unzip gtirb-wheel.zip
+    - mkdir gtirb-wheel && cp *.whl gtirb-wheel/
+    - docker run -v $(pwd)/gtirb-wheel:/gtirb-wheel:ro --cpus=8 ${LOCAL_IMAGE_NAME}-${OS}-${COMPILER}-${BUILD_TYPE,,} /bin/bash -c "python3 -m pip install pip --upgrade && python3 -m pip install /gtirb-wheel/gtirb-*-py*.whl && ( cd /home/ddisasm/ddisasm-aur/src/ddisasm/build || cd build/  && ctest -V )"
+    - docker tag ${LOCAL_IMAGE_NAME}-${OS}-${COMPILER}-${BUILD_TYPE,,} $DOCKER_REGISTRY/$CI_PROJECT_PATH/${OS}-${COMPILER}-${BUILD_TYPE,,}:${PUSH_TAG};
+    - docker login -u gitlab-ci-token -p $CI_BUILD_TOKEN $DOCKER_REGISTRY;
+    - docker push $DOCKER_REGISTRY/$CI_PROJECT_PATH/${OS}-${COMPILER}-${BUILD_TYPE,,}:${PUSH_TAG};
 
-run-ubuntu18:
+.cleanup-template: &cleanup
+  script:
+    - docker rmi -f ${LOCAL_IMAGE_NAME}-${OS}-${COMPILER}-${BUILD_TYPE,,}
+
+check-format:
+  stage: check-format
+  script:
+    - docker build --rm -f .ci/Dockerfile.formatter .
+
+build-ubuntu16-gcc:
+  stage: build
+  variables:
+    OS: 'ubuntu16'
+    COMPILER: 'gcc'
+    CPACK_GENERATOR: 'DEB'
+    BUILD_TYPE: 'RelWithDebInfo'
+  <<: *build
+
+build-ubuntu18-gcc:
+  stage: build
+  variables:
+    OS: 'ubuntu18'
+    COMPILER: 'gcc'
+    CPACK_GENERATOR: 'DEB'
+    BUILD_TYPE: 'RelWithDebInfo'
+  <<: *build
+
+build-arch-gcc:
+  stage: build
+  variables:
+    OS: 'arch'
+    COMPILER: 'gcc'
+    BUILD_TYPE: 'RelWithDebInfo'
+  <<: *build
+
+build-arch-clang:
+  stage: build
+  variables:
+    OS: 'arch'
+    COMPILER: 'clang'
+    BUILD_TYPE: 'RelWithDebInfo'
+  <<: *build
+
+build-arch-gcc-debug:
+  stage: build
+  variables:
+    OS: 'arch'
+    COMPILER: 'gcc'
+    BUILD_TYPE: 'Debug'
+  <<: *build
+
+build-arch-clang-debug:
+  stage: build
+  variables:
+    OS: 'arch'
+    COMPILER: 'clang'
+    BUILD_TYPE: 'Debug'
+  <<: *build
+
+build-windows-msvc-debug:
+  stage: build
+  tags:
+    - ddisasm-windows
+  variables:
+    BUILD_TYPE: 'Debug'
+  <<: *build-windows
+
+build-windows-msvc-relwithdebinfo:
+  stage: build
+  tags:
+    - ddisasm-windows
+  variables:
+    BUILD_TYPE: 'RelWithDebInfo'
+  <<: *build-windows
+
+run-ubuntu16-gcc:
+  stage: test-and-tag
+  variables:
+    OS: 'ubuntu16'
+    COMPILER: 'gcc'
+    BUILD_TYPE: 'RelWithDebInfo'
+  <<: *test-and-tag
+
+run-ubuntu18-gcc:
   stage: test-and-tag
   variables:
     OS: 'ubuntu18'
-  script:
-    - docker run ${LOCAL_IMAGE_NAME}-${OS} /bin/bash -c \
-      "cd tests/ && ./test_small.sh && ./test_small.sh -strip && ./test_assembler_examples.sh -strip"
+    COMPILER: 'gcc'
+    BUILD_TYPE: 'RelWithDebInfo'
+  <<: *test-and-tag
 
-cleanup-ubuntu16:
+run-arch-gcc:
+  stage: test-and-tag
+  variables:
+    OS: 'arch'
+    COMPILER: 'gcc'
+    BUILD_TYPE: 'RelWithDebInfo'
+  <<: *test-and-tag
+
+run-arch-clang:
+  stage: test-and-tag
+  variables:
+    OS: 'arch'
+    COMPILER: 'clang'
+    BUILD_TYPE: 'RelWithDebInfo'
+  script:
+  <<: *test-and-tag
+
+run-arch-gcc-debug:
+  stage: test-and-tag
+  variables:
+    OS: 'arch'
+    COMPILER: 'gcc'
+    BUILD_TYPE: 'Debug'
+  <<: *test-and-tag
+
+run-arch-clang-debug:
+  stage: test-and-tag
+  variables:
+    OS: 'arch'
+    COMPILER: 'clang'
+    BUILD_TYPE: 'Debug'
+  script:
+  <<: *test-and-tag
+
+test-make-install:
+  stage: test-and-tag
+  variables:
+    OS: 'ubuntu18'
+    COMPILER: 'gcc'
+    BUILD_TYPE: 'RelWithDebInfo'
+  script:
+    - docker build --rm -f .ci/Dockerfile.test-install --build-arg IMAGE=${LOCAL_IMAGE_NAME}-${OS}-${COMPILER}-${BUILD_TYPE,,} .
+
+cleanup-ubuntu16-gcc:
   stage: cleanup
   variables:
     OS: 'ubuntu16'
-  script:
-    - docker rmi -f ${LOCAL_IMAGE_NAME}-${OS}
+    COMPILER: 'gcc'
+    BUILD_TYPE: 'RelWithDebInfo'
+  <<: *cleanup
 
-cleanup-ubuntu18:
+cleanup-ubuntu18-gcc:
   stage: cleanup
   variables:
     OS: 'ubuntu18'
-  script:
-    - docker rmi -f ${LOCAL_IMAGE_NAME}-${OS}
+    COMPILER: 'gcc'
+    BUILD_TYPE: 'RelWithDebInfo'
+  <<: *cleanup
 
-cleanup-arch:
+cleanup-arch-gcc:
   stage: cleanup
   variables:
     OS: 'arch'
-  script:
-    - docker rmi -f ${LOCAL_IMAGE_NAME}-${OS}
+    COMPILER: 'gcc'
+    BUILD_TYPE: 'RelWithDebInfo'
+  <<: *cleanup
 
-# build-arch:
-#   stage: build-deploy-cleanup
-#   variables:
-#     OS: 'arch'
-#   <<: *build
+cleanup-arch-clang:
+  stage: cleanup
+  variables:
+    OS: 'arch'
+    COMPILER: 'clang'
+    BUILD_TYPE: 'RelWithDebInfo'
+  <<: *cleanup
+
+cleanup-arch-gcc-debug:
+  stage: cleanup
+  variables:
+    OS: 'arch'
+    COMPILER: 'gcc'
+    BUILD_TYPE: 'Debug'
+  <<: *cleanup
+
+cleanup-arch-clang-debug:
+  stage: cleanup
+  variables:
+    OS: 'arch'
+    COMPILER: 'clang'
+    BUILD_TYPE: 'Debug'
+  <<: *cleanup
+
+.linux-installer-template: &linux-installer
+  stage: deploy
+  artifacts:
+    name: "$CI_COMMIT_REF_NAME-$CI_JOB_NAME"
+    paths:
+      - ./*.${EXTENSION}
+  script:
+    - case $OS in
+       ubuntu16) JOB_NAME='debian-installer-ubuntu16' ;;
+       ubuntu18) JOB_NAME='debian-installer-ubuntu18' ;;
+       arch) JOB_NAME='package-arch' ;;
+       esac
+    # Acquire gtirb artifacts
+    - curl -L https://git.grammatech.com/rewriting/gtirb/-/jobs/artifacts/${GTIRB_BRANCH}/download?job=${JOB_NAME} --output "gtirb-${OS}-artifacts.zip"
+    # Acquire gtirb pprinter artifacts
+    - GTIRB_PPRINTER_BRANCH=$((grep -Eo "check_gtirb_pprinter_branch\([^)]+" CMakeLists.txt | sed 's/check_gtirb_pprinter_branch(//') || echo "master")
+    - "echo \"GTIRB_PPRINTER_BRANCH is: $GTIRB_PPRINTER_BRANCH\""
+    - curl -L https://git.grammatech.com/rewriting/gtirb-pprinter/-/jobs/artifacts/${GTIRB_PPRINTER_BRANCH}/download?job=${JOB_NAME} --output "gtirb-pprinter-${OS}-artifacts.zip"
+    # Acquire extra packages
+    - cp /u4/TARBALLS/debloat/pkgs/libcapstone-dev_4.0.1-gt2_amd64.deb ./
+    # Get ddisasm package
+    - export CONTAINER_FILE=$(mktemp -d)/cidfile
+    - docker create --cidfile=${CONTAINER_FILE} ${LOCAL_IMAGE_NAME}-${OS}-${COMPILER}-${BUILD_TYPE,,}
+    - docker cp $(cat ${CONTAINER_FILE}):/ddisasm/build ./build-artifacts
+    - docker container rm -f $(cat ${CONTAINER_FILE})
+    - rm -rf $(dirname ${CONTAINER_FILE})
+    - mv ./build-artifacts/*.${EXTENSION} ./
+    - rm -rf ./build-artifacts
+    # Run the test
+    - if [ -f .ci/Dockerfile.test-${OS}-package ]; then docker build -f .ci/Dockerfile.test-${OS}-package -t ${LOCAL_IMAGE_NAME}-${OS}-package-test .; docker rmi ${LOCAL_IMAGE_NAME}-${OS}-package-test; fi
+
+debian-installer-ubuntu16:
+  variables:
+    OS: 'ubuntu16'
+    COMPILER: 'gcc'
+    EXTENSION: 'deb'
+    BUILD_TYPE: 'RelWithDebInfo'
+  <<: *linux-installer
+
+debian-installer-ubuntu18:
+  variables:
+    OS: 'ubuntu18'
+    COMPILER: 'gcc'
+    EXTENSION: 'deb'
+    BUILD_TYPE: 'RelWithDebInfo'
+  <<: *linux-installer
+
+package-arch:
+  variables:
+    OS: 'arch'
+    COMPILER: 'gcc'
+    EXTENSION: 'pkg.tar.xz'
+    BUILD_TYPE: 'RelWithDebInfo'
+  <<: *linux-installer

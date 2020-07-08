@@ -2,7 +2,7 @@ CC="gcc"
 CFLAGS=
 
 
-all: ex.c 
+all: ex.c
 	$(CC) ex.c  $(CFLAGS) -o ex
 	@ echo "A" |./ex > out.txt
 	@ echo "B" |./ex >> out.txt
@@ -14,6 +14,4 @@ check:
 	@ echo "A" |./ex > /tmp/res.txt
 	@ echo "B" |./ex >> /tmp/res.txt
 	@ echo "C" |./ex >> /tmp/res.txt
-	@ bash ./test.sh
-
-
+	@ diff out.txt /tmp/res.txt && echo TEST OK
